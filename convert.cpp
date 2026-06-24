@@ -178,22 +178,17 @@ static_assert(sizeof(OutputRecord) == 233, "OutputRecord must be 233 bytes");
 
 // ===========================================================================
 // 數字 -> 靠右、補前導 0 的固定寬度 ASCII。
-// 值非負(計數/價格/時間)。超出欄位寬度視為資料異常: 保留低位數並計數警告。
+// 值非負(計數/價格/時間)。位數超過欄位寬度視為資料異常 -> 報錯中止。
 // ===========================================================================
-static unsigned long long g_overflow = 0;
-static int                g_overflow_logged = 0;
-
 static inline void fmt_u(uint64_t v, char* dst, int width,
                          const char* field, unsigned long long rec) {
     uint64_t orig = v;
     for (int i = width - 1; i >= 0; --i) { dst[i] = char('0' + (int)(v % 10)); v /= 10; }
-    if (v != 0) {                       // 位數比欄位寬 -> 溢位
-        ++g_overflow;
-        if (g_overflow_logged < 10) {
-            fprintf(stderr, "warn: record %llu field %s value %llu overflows %d digits\n",
-                    rec, field, (unsigned long long)orig, width);
-            ++g_overflow_logged;
-        }
+    if (v != 0) {                       // 位數比欄位寬 -> 溢位，中止
+        fprintf(stderr,
+                "FATAL: record %llu field %s value %llu exceeds %d-digit width. Aborting.\n",
+                rec, field, (unsigned long long)orig, width);
+        exit(2);
     }
 }
 
@@ -344,9 +339,7 @@ int main(int argc, char* argv[]) {
     if (close(in_fd) < 0)  perror("close input");
     if (close(out_fd) < 0) perror("close output");   // 確認資料落地
 
-    fprintf(stderr, "Done. %llu records. BATCH=%zu read_buf=%zu write_buf=%zu",
+    fprintf(stderr, "Done. %llu records. BATCH=%zu read_buf=%zu write_buf=%zu\n",
             total, BATCH, READ_BUF_SIZE, WRITE_BUF_SIZE);
-    if (g_overflow) fprintf(stderr, " (WARNING: %llu numeric overflow fields)", g_overflow);
-    fprintf(stderr, "\n");
     return 0;
 }
