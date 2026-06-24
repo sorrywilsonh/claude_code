@@ -1,0 +1,4 @@
+convert
+*.o
+*.dat
+out.txt
