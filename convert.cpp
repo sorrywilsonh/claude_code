@@ -7,8 +7,9 @@
 //   1. 直接 #include "todsys.h"，用你自己的 schema 型別 tlodru_rec_def /
 //      stlodr_rec_def。layout 由 header 的 #pragma fieldalign shared2 保證，
 //      不必在這支程式重猜 packing。編譯期用 typedef 斷言卡住 sizeof。
-//   2. 檔案 I/O 用 Guardian 原生程序: FILE_OPEN_ / READX / WRITEX /
-//      FILE_CLOSE_ (輸出檔以 FILE_CREATE_ 重新建立，PURGE 掉舊內容)。
+//   2. 檔案 I/O 用 Guardian PUT library: PUT_FILE_OPEN_ / PUT_READX /
+//      PUT_WRITEX / PUT_FILE_CLOSE_ (輸出檔以 PUT_FILE_CREATE_ 重新建立，
+//      PUT_PURGE 掉舊內容)。
 //   3. Guardian 檔案系統單次傳輸上限 = 57344 byte。每批 record 數
 //      = min(57344/280, 57344/233) = 204 -> 讀 204*280 = 57120、
 //        寫 204*233 = 47532，皆 <= 57344，且為 record 整數倍不切斷。
@@ -35,7 +36,9 @@
 // ===========================================================================
 #if defined(_GUARDIAN_TARGET) || defined(USE_GUARDIAN)
 #  define IO_GUARDIAN 1
-#  include <cextdecs(FILE_OPEN_, FILE_CREATE_, PURGE, READX, WRITEX, FILE_CLOSE_)>
+   // PUT library 的函式宣告標頭。請改成你站上 PUT 函式庫實際的標頭名稱；
+   // 若 PUT_ 函式仍需底層系統程序，可能要一併保留對應的 cextdecs。
+#  include <putlib.h>      /* TODO: 換成實際 PUT library 標頭 */
    typedef short io_handle;
 #else
 #  define IO_GUARDIAN 0
@@ -156,13 +159,16 @@ static const size_t WRITE_BUF_SIZE = BATCH * OUT_REC;  // 47532 <= 57344
 // ===========================================================================
 #if IO_GUARDIAN
 
-// ---- Guardian 原生檔案系統 ----
+// ---- Guardian PUT library ----
+// 註: 以下假設 PUT_ 函式與對應的 Guardian 系統程序「簽章相同、只是加 PUT_ 前綴」
+//     (參數順序、回傳 error 慣例、EOF=1 等)。請對照 PUT library 手冊確認；
+//     若 PUT 版本的參數或回傳慣例不同，需依手冊調整。
 static io_handle io_open_read(const char* name) {
     short fnum;
-    short err = FILE_OPEN_((char*)name, (short)strlen(name), &fnum,
-                           /*access   */ 1,    // 1 = read-only
-                           /*exclusion*/ 0);   // 0 = shared
-    if (err) { fprintf(stderr, "FILE_OPEN_ input '%s' error %d\n", name, err); exit(1); }
+    short err = PUT_FILE_OPEN_((char*)name, (short)strlen(name), &fnum,
+                               /*access   */ 1,    // 1 = read-only
+                               /*exclusion*/ 0);   // 0 = shared
+    if (err) { fprintf(stderr, "PUT_FILE_OPEN_ input '%s' error %d\n", name, err); exit(1); }
     return fnum;
 }
 
@@ -170,18 +176,18 @@ static io_handle io_open_write(const char* name) {
     short fnum;
     short len = (short)strlen(name);
     // 確保輸出為全新檔: 建立; 若已存在(10)就 PURGE 後重建，避免殘留舊資料。
-    short cerr = FILE_CREATE_((char*)name, len);   // 省略選用參數 -> 預設 unstructured
-    if (cerr == 10) {                              // 10 = file already exists
-        short perr = PURGE((char*)name, len);
-        if (perr) { fprintf(stderr, "PURGE '%s' error %d\n", name, perr); exit(1); }
-        cerr = FILE_CREATE_((char*)name, len);
+    short cerr = PUT_FILE_CREATE_((char*)name, len);   // 省略選用參數 -> 預設 unstructured
+    if (cerr == 10) {                                  // 10 = file already exists
+        short perr = PUT_PURGE((char*)name, len);
+        if (perr) { fprintf(stderr, "PUT_PURGE '%s' error %d\n", name, perr); exit(1); }
+        cerr = PUT_FILE_CREATE_((char*)name, len);
     }
-    if (cerr) { fprintf(stderr, "FILE_CREATE_ '%s' error %d\n", name, cerr); exit(1); }
+    if (cerr) { fprintf(stderr, "PUT_FILE_CREATE_ '%s' error %d\n", name, cerr); exit(1); }
 
-    short err = FILE_OPEN_((char*)name, len, &fnum,
-                           /*access   */ 2,    // 2 = write-only
-                           /*exclusion*/ 1);   // 1 = exclusive
-    if (err) { fprintf(stderr, "FILE_OPEN_ output '%s' error %d\n", name, err); exit(1); }
+    short err = PUT_FILE_OPEN_((char*)name, len, &fnum,
+                               /*access   */ 2,    // 2 = write-only
+                               /*exclusion*/ 1);   // 1 = exclusive
+    if (err) { fprintf(stderr, "PUT_FILE_OPEN_ output '%s' error %d\n", name, err); exit(1); }
     return fnum;
 }
 
@@ -190,9 +196,9 @@ static size_t io_read_block(io_handle fnum, char* buf, size_t want) {
     size_t got = 0;
     while (got < want) {
         unsigned short xfer = 0;
-        short err = READX(fnum, buf + got, (unsigned short)(want - got), &xfer);
+        short err = PUT_READX(fnum, buf + got, (unsigned short)(want - got), &xfer);
         if (err == 1) break;            // 1 = EOF
-        if (err) { fprintf(stderr, "READX error %d\n", err); exit(1); }
+        if (err) { fprintf(stderr, "PUT_READX error %d\n", err); exit(1); }
         if (xfer == 0) break;
         got += xfer;
     }
@@ -204,16 +210,16 @@ static void io_write_block(io_handle fnum, const char* buf, size_t len) {
     size_t done = 0;
     while (done < len) {
         unsigned short xfer = 0;
-        short err = WRITEX(fnum, (char*)(buf + done), (unsigned short)(len - done), &xfer);
-        if (err) { fprintf(stderr, "WRITEX error %d\n", err); exit(1); }
-        if (xfer == 0) { fprintf(stderr, "WRITEX wrote 0 bytes\n"); exit(1); }
+        short err = PUT_WRITEX(fnum, (char*)(buf + done), (unsigned short)(len - done), &xfer);
+        if (err) { fprintf(stderr, "PUT_WRITEX error %d\n", err); exit(1); }
+        if (xfer == 0) { fprintf(stderr, "PUT_WRITEX wrote 0 bytes\n"); exit(1); }
         done += xfer;
     }
 }
 
 static void io_close(io_handle fnum, const char* what) {
-    short err = FILE_CLOSE_(fnum);
-    if (err) fprintf(stderr, "FILE_CLOSE_ %s error %d\n", what, err);
+    short err = PUT_FILE_CLOSE_(fnum);
+    if (err) fprintf(stderr, "PUT_FILE_CLOSE_ %s error %d\n", what, err);
 }
 
 #else  // ---- POSIX (本機測試) ----
