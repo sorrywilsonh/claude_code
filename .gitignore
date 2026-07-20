@@ -2,3 +2,5 @@ convert
 *.o
 *.dat
 out.txt
+__pycache__/
+*.pyc
