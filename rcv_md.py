@@ -19,16 +19,18 @@ log = logging.getLogger('mcast_rcv')
 
 # --- 多播群組清單：想收幾組就加幾組 ---
 # 每一組都是一個 dict：
-#   name   : 自訂名稱，只用來在 log / 檔案裡辨識，方便閱讀
-#   grp    : multicast group 位址
-#   port   : multicast port
-#   enable : 這次啟動要不要收這一組（True=收、False=跳過）
+#   name    : 自訂名稱，只用來在 log / 檔案裡辨識，方便閱讀
+#   grp     : multicast group 位址
+#   port    : multicast port
+#   enable  : 這次啟動要不要收這一組（True=收、False=跳過）
+#   outfile : 這一組的行情要寫到哪個檔案（可省略，省略時用 DEFAULT_OUTPUT_FILE）
+#             不同組可以寫不同檔；若幾組填一樣的檔名，就會一起寫進同一個檔。
 MCAST_GROUPS = [
-    {'name': 'feed_A', 'grp': '233.6.100.100', 'port': 10006, 'enable': True},
-    {'name': 'feed_B', 'grp': '233.6.100.101', 'port': 10007, 'enable': True},
-    {'name': 'feed_C', 'grp': '233.6.100.102', 'port': 10008, 'enable': False},
+    {'name': 'feed_A', 'grp': '233.6.100.100', 'port': 10006, 'enable': True,  'outfile': 'feed_A.log'},
+    {'name': 'feed_B', 'grp': '233.6.100.101', 'port': 10007, 'enable': True,  'outfile': 'feed_B.log'},
+    {'name': 'feed_C', 'grp': '233.6.100.102', 'port': 10008, 'enable': False, 'outfile': 'feed_C.log'},
     # 想再加就往下貼：
-    # {'name': 'feed_D', 'grp': '233.6.100.103', 'port': 10009, 'enable': True},
+    # {'name': 'feed_D', 'grp': '233.6.100.103', 'port': 10009, 'enable': True, 'outfile': 'feed_D.log'},
 ]
 
 IFACE_IP = '0.0.0.0'          # 多網卡時改成要收封包那張網卡的 IP
@@ -38,9 +40,9 @@ IFACE_IP = '0.0.0.0'          # 多網卡時改成要收封包那張網卡的 IP
 # 設成 0 或負數代表「不限時，一直收到使用者 Ctrl+C 為止」。
 RECV_DURATION_SEC = 60
 
-# --- 行情資訊輸出檔 ---
-# 每一筆收到的封包都會寫進這個檔案。
-OUTPUT_FILE = 'market_data.log'
+# --- 預設行情資訊輸出檔 ---
+# 當某一組沒有指定自己的 outfile 時，就寫進這個預設檔。
+DEFAULT_OUTPUT_FILE = 'market_data.log'
 
 # ==========================================================================
 
@@ -123,28 +125,38 @@ def main():
     log.info('本次啟用 %d 組群組：%s', len(enabled),
              ', '.join(f"{c['name']}({c['grp']}:{c['port']})" for c in enabled))
 
-    # --- 為每一組建立 socket；記下 fileno -> 設定 的對照，收到封包時好辨識來源 ---
+    # --- 依各組的 outfile 開檔；同一個檔名只開一次，讓填相同檔名的群組共用 handle ---
+    files_by_path = {}   # 檔名 -> file handle
+
+    def open_outfile(path):
+        if path not in files_by_path:
+            # buffering=1 = 行緩衝，隨寫隨落
+            files_by_path[path] = open(path, 'a', buffering=1)
+        return files_by_path[path]
+
+    # --- 為每一組建立 socket 並開好輸出檔；
+    #     記下 fileno -> (socket, 設定, file) 的對照，收到封包時好辨識來源與寫入目標 ---
     sock_by_fd = {}
     for cfg in enabled:
+        path = cfg.get('outfile') or DEFAULT_OUTPUT_FILE
+        try:
+            fh = open_outfile(path)
+        except OSError as e:
+            log.error('[%s] 無法開啟輸出檔 %s：%s（此組略過）', cfg['name'], path, e)
+            continue
+
         s = setup_socket(cfg)
         if s is not None:
-            sock_by_fd[s.fileno()] = (s, cfg)
+            sock_by_fd[s.fileno()] = (s, cfg, fh)
+            log.info('[%s] 行情資訊將寫入檔案：%s', cfg['name'], path)
 
     if not sock_by_fd:
         log.error('所有群組都建立失敗，結束。')
+        for fh in files_by_path.values():
+            fh.close()
         sys.exit(1)
 
-    socks = [s for (s, _) in sock_by_fd.values()]
-
-    # --- 開啟輸出檔 ---
-    try:
-        out = open(OUTPUT_FILE, 'a', buffering=1)  # buffering=1 = 行緩衝，隨寫隨落
-        log.info('行情資訊將寫入檔案：%s', OUTPUT_FILE)
-    except OSError as e:
-        log.error('無法開啟輸出檔 %s：%s', OUTPUT_FILE, e)
-        for s in socks:
-            s.close()
-        sys.exit(1)
+    socks = [s for (s, _, _) in sock_by_fd.values()]
 
     # --- 接收迴圈（限時 or 不限時）---
     unlimited = RECV_DURATION_SEC <= 0
@@ -178,7 +190,7 @@ def main():
                 continue
 
             for s in readable:
-                _, cfg = sock_by_fd[s.fileno()]
+                _, cfg, fh = sock_by_fd[s.fileno()]
                 try:
                     data, address = s.recvfrom(65535)
                 except OSError as e:
@@ -189,8 +201,8 @@ def main():
                 ts = time.strftime('%Y-%m-%d %H:%M:%S')
                 log.info('[%s] 收到第 %d 筆，來自 %s，%d bytes',
                          cfg['name'], recv_count, address, len(data))
-                # 寫入行情資訊檔：時間、群組名、群組位址:port、來源、長度、內容(hex)
-                out.write('%s\t%s\t%s:%d\tfrom=%s\tlen=%d\t%s\n' % (
+                # 寫入該組對應的行情資訊檔：時間、群組名、群組位址:port、來源、長度、內容(hex)
+                fh.write('%s\t%s\t%s:%d\tfrom=%s\tlen=%d\t%s\n' % (
                     ts, cfg['name'], cfg['grp'], cfg['port'],
                     address, len(data), data.hex()))
 
@@ -198,14 +210,15 @@ def main():
         log.info('使用者中斷，準備收尾。')
 
     # --- 收尾 ---
-    out.flush()
-    out.close()
+    for fh in files_by_path.values():
+        fh.flush()
+        fh.close()
     for s in socks:
         s.close()
 
     elapsed = time.monotonic() - start
-    log.info('全部 socket 已關閉，共收到 %d 筆封包（實際接收 %.1f 秒），資料已寫入 %s',
-             recv_count, elapsed, OUTPUT_FILE)
+    log.info('全部 socket 已關閉，共收到 %d 筆封包（實際接收 %.1f 秒），輸出檔：%s',
+             recv_count, elapsed, ', '.join(sorted(files_by_path)))
 
 
 if __name__ == '__main__':
