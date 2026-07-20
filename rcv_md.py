@@ -5,13 +5,9 @@ import sys
 import time
 import select
 
-# --- log 設定：帶時間戳，方便對照封包到達時間 ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%H:%M:%S'
-)
+# --- log 物件（實際的輸出目的地在下方設定區決定後才掛上）---
 log = logging.getLogger('mcast_rcv')
+log.setLevel(logging.INFO)
 
 # ==========================================================================
 # 使用者設定區
@@ -26,11 +22,11 @@ log = logging.getLogger('mcast_rcv')
 #   outfile : 這一組的行情要寫到哪個檔案（可省略，省略時用 DEFAULT_OUTPUT_FILE）
 #             不同組可以寫不同檔；若幾組填一樣的檔名，就會一起寫進同一個檔。
 MCAST_GROUPS = [
-    {'name': 'feed_A', 'grp': '233.6.100.100', 'port': 10006, 'enable': True,  'outfile': 'feed_A.log'},
-    {'name': 'feed_B', 'grp': '233.6.100.101', 'port': 10007, 'enable': True,  'outfile': 'feed_B.log'},
-    {'name': 'feed_C', 'grp': '233.6.100.102', 'port': 10008, 'enable': False, 'outfile': 'feed_C.log'},
+    {'name': 'feed_A', 'grp': '233.6.100.100', 'port': 10006, 'enable': True,  'outfile': 'feed_A.bin'},
+    {'name': 'feed_B', 'grp': '233.6.100.101', 'port': 10007, 'enable': True,  'outfile': 'feed_B.bin'},
+    {'name': 'feed_C', 'grp': '233.6.100.102', 'port': 10008, 'enable': False, 'outfile': 'feed_C.bin'},
     # 想再加就往下貼：
-    # {'name': 'feed_D', 'grp': '233.6.100.103', 'port': 10009, 'enable': True, 'outfile': 'feed_D.log'},
+    # {'name': 'feed_D', 'grp': '233.6.100.103', 'port': 10009, 'enable': True, 'outfile': 'feed_D.bin'},
 ]
 
 IFACE_IP = '0.0.0.0'          # 多網卡時改成要收封包那張網卡的 IP
@@ -42,9 +38,42 @@ RECV_DURATION_SEC = 60
 
 # --- 預設行情資訊輸出檔 ---
 # 當某一組沒有指定自己的 outfile 時，就寫進這個預設檔。
-DEFAULT_OUTPUT_FILE = 'market_data.log'
+# 注意：這些「行情資料檔」只放接收到的原始封包位元組（binary），
+#       一個封包接著一個封包原樣寫入，不混入時間/群組/來源等任何其他資訊，
+#       方便直接餵給 convert 之類的工具做後續解析。
+DEFAULT_OUTPUT_FILE = 'market_data.bin'
+
+# --- 執行紀錄（log）輸出方式 ---
+# 這裡的 log 指「每筆封包一行的訊息」以及程式運作訊息（含時間、群組、來源、長度、hex），
+# 和上面各組的「純行情資料檔」是分開的兩回事，彼此不會混入。
+#   LOG_TO_SCREEN : 是否把即時訊息刷在畫面（螢幕 / stdout）上。
+#   RCV_LOG_FILE  : 執行紀錄要寫到哪個檔；設成 None 或 '' 代表不寫檔。
+# 兩者可各自開關。預設「只寫進 rcv_log 檔、不刷畫面」。
+LOG_TO_SCREEN = False
+RCV_LOG_FILE  = 'rcv_log.txt'
 
 # ==========================================================================
+
+
+def _configure_logging():
+    """依設定把 log 掛到畫面 / 檔案。至少會保留一個輸出，避免訊息全丟失。"""
+    fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s',
+                            datefmt='%Y-%m-%d %H:%M:%S')
+    if RCV_LOG_FILE:
+        try:
+            fh = logging.FileHandler(RCV_LOG_FILE, encoding='utf-8')
+            fh.setFormatter(fmt)
+            log.addHandler(fh)
+        except OSError as e:
+            sys.stderr.write('無法開啟 log 檔 %s：%s，改輸出到畫面\n' % (RCV_LOG_FILE, e))
+    # 有要求刷畫面，或者上面沒能掛上任何 handler（例如沒設 log 檔）時，補一個螢幕輸出
+    if LOG_TO_SCREEN or not log.handlers:
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        log.addHandler(sh)
+
+
+_configure_logging()
 
 
 def mcast_in_igmp(group):
@@ -130,8 +159,8 @@ def main():
 
     def open_outfile(path):
         if path not in files_by_path:
-            # buffering=1 = 行緩衝，隨寫隨落
-            files_by_path[path] = open(path, 'a', buffering=1)
+            # 'ab' = 二進位附加、buffering=0 = 不緩衝，收到就直接落地；只寫原始封包位元組
+            files_by_path[path] = open(path, 'ab', buffering=0)
         return files_by_path[path]
 
     # --- 為每一組建立 socket 並開好輸出檔；
@@ -198,14 +227,12 @@ def main():
                     continue
 
                 recv_count += 1
-                ts = time.strftime('%Y-%m-%d %H:%M:%S')
-                # 組出這一筆的完整記錄：時間、群組名、群組位址:port、來源、長度、內容(hex)
-                record = '%s\t%s\t%s:%d\tfrom=%s\tlen=%d\t%s' % (
-                    ts, cfg['name'], cfg['grp'], cfg['port'],
-                    address, len(data), data.hex())
-                # 同一份完整記錄：一邊進 log，一邊寫進該組對應的行情資訊檔
-                log.info('[%s] 收到第 %d 筆：%s', cfg['name'], recv_count, record)
-                fh.write(record + '\n')
+                # log（rcv_log 檔或畫面）：每筆封包一行的訊息，含群組、來源、長度、hex
+                log.info('[%s] 收到第 %d 筆\t%s:%d\tfrom=%s\tlen=%d\t%s',
+                         cfg['name'], recv_count, cfg['grp'], cfg['port'],
+                         address, len(data), data.hex())
+                # 行情資料檔：只寫原始封包位元組，不混入任何其他資訊
+                fh.write(data)
 
     except KeyboardInterrupt:
         log.info('使用者中斷，準備收尾。')
