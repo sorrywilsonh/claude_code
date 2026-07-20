@@ -199,12 +199,13 @@ def main():
 
                 recv_count += 1
                 ts = time.strftime('%Y-%m-%d %H:%M:%S')
-                log.info('[%s] 收到第 %d 筆，來自 %s，%d bytes',
-                         cfg['name'], recv_count, address, len(data))
-                # 寫入該組對應的行情資訊檔：時間、群組名、群組位址:port、來源、長度、內容(hex)
-                fh.write('%s\t%s\t%s:%d\tfrom=%s\tlen=%d\t%s\n' % (
+                # 組出這一筆的完整記錄：時間、群組名、群組位址:port、來源、長度、內容(hex)
+                record = '%s\t%s\t%s:%d\tfrom=%s\tlen=%d\t%s' % (
                     ts, cfg['name'], cfg['grp'], cfg['port'],
-                    address, len(data), data.hex()))
+                    address, len(data), data.hex())
+                # 同一份完整記錄：一邊進 log，一邊寫進該組對應的行情資訊檔
+                log.info('[%s] 收到第 %d 筆：%s', cfg['name'], recv_count, record)
+                fh.write(record + '\n')
 
     except KeyboardInterrupt:
         log.info('使用者中斷，準備收尾。')
